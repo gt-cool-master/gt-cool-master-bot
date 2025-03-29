@@ -1,106 +1,110 @@
 import os
-import json
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from flask import Flask, request
+import requests
+import asyncio
+from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
-    filters,
     ContextTypes,
+    filters,
 )
-from flask import Flask, request
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID"))
-VIP_USERS = set()  # временно, позже подключим базу
-COURSE_USERS = set()
-
+# Инициализация Flask-сервера
 app = Flask(__name__)
 
-keyboard = ReplyKeyboardMarkup(
-    [
-        [KeyboardButton("Старт обучения")],
-        [KeyboardButton("Курс + Чат (VIP Bonus)")],
-        [KeyboardButton("Поддержка"), KeyboardButton("О курсе")]
-    ],
-    resize_keyboard=True
-)
+# Данные из переменных окружения
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID"))
 
-# ==== ОБРАБОТЧИКИ КНОПОК И КОМАНД ====
+# Сюда будем сохранять доступы
+user_access = {}
 
+# Команда /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id == ADMIN_ID:
-        await update.message.reply_text(f"Привет, админ! Твой ID: {user_id}", reply_markup=keyboard)
+        text = f"Привет, админ! Твой ID: {user_id}"
     else:
-        await update.message.reply_text("Добро пожаловать! Выберите действие с помощью кнопок ниже.", reply_markup=keyboard)
+        text = (
+            "Привет! Добро пожаловать в GT COOL MASTER BOT.\n"
+            "Выберите действие с помощью кнопок ниже."
+        )
+    keyboard = [["Старт обучения"], ["Курс + Чат (VIP Bonus)"], ["Поддержка", "О курсе"]]
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    await update.message.reply_text(text, reply_markup=reply_markup)
 
-async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# Обработка нажатий на кнопки
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text
 
     if text == "Старт обучения":
-        if user_id in COURSE_USERS:
-            await update.message.reply_text("Добро пожаловать на обучение! Вот ваш первый модуль: [ссылка]")
+        if user_access.get(user_id, {}).get("course"):
+            await update.message.reply_text("Обучение уже доступно. Добро пожаловать!")
         else:
-            await update.message.reply_text("Чтобы начать обучение, необходимо оплатить доступ. Стоимость курса: 999₽\n[Тут будет ссылка на оплату]")
-
+            await update.message.reply_text(
+                "Чтобы начать обучение, необходимо оплатить доступ. Стоимость курса: 999₽\n"
+                "[Тут будет ссылка на оплату]"
+            )
     elif text == "Курс + Чат (VIP Bonus)":
-        await update.message.reply_text(
-            "Дополнительная опция: VIP-доступ с чатом поддержки.\n"
-            "— Месячная подписка: 599₽/мес\n"
-            "— Навсегда: 2,999₽\n\n"
-            "Ты получаешь:\n"
-            "— Общение с профи\n"
-            "— Помощь в работе с клиентами\n"
-            "— Поддержку и обратную связь\n\n"
-            "Хочешь оформить доступ? [Тут будет кнопка/ссылка на оплату]"
-        )
-
+        if user_access.get(user_id, {}).get("vip"):
+            await update.message.reply_text("У тебя уже есть VIP доступ. Заходи в чат!")
+        else:
+            await update.message.reply_text(
+                "Дополнительная опция: VIP-доступ с чатом поддержки.\n"
+                "— Месячная подписка: 599₽/мес\n"
+                "— Пожизненный доступ: 2,999₽\n\n"
+                "Хочешь оформить доступ? [Тут будет кнопка или ссылка]"
+            )
     elif text == "Поддержка":
-        await update.message.reply_text("Оставьте своё сообщение здесь — мы свяжемся с вами в ближайшее время.")
-
+        await update.message.reply_text(
+            "Оставьте своё сообщение здесь — мы свяжемся с вами в ближайшее время."
+        )
     elif text == "О курсе":
         await update.message.reply_text(
-            "Курс охватывает:\n"
-            "— Установку кондиционеров от простых до VRF-систем\n"
-            "— Чтение чертежей и расчёт смет\n"
-            "— Продажи, общение с клиентами и закрытие сделок\n"
-            "— Полная схема запуска с нуля\n\n"
-            "Обучение проходит поэтапно с сопровождением."
+            "GT COOL MASTER — обучающий курс по установке кондиционеров всех типов:\n"
+            "— Базовые, сплит-системы, VRF\n"
+            "— Расчёт по чертежам, сметы, техника общения с клиентами\n\n"
+            "Всё на практике, с поддержкой и гарантией результата."
         )
+    else:
+        await update.message.reply_text("Выберите действие с помощью кнопок ниже.")
 
-# ==== API ПЛАТЕЖЕЙ (CryptoCloud) ====
-
-@app.route("/payment-notify", methods=["POST"])
-def crypto_payment_notify():
+# Webhook для приёма уведомлений от CryptoCloud
+@app.route("/payment_webhook", methods=["POST"])
+def payment_webhook():
     data = request.json
-    if data and data.get("status") == "paid":
-        order_id = data.get("order_id")
-        telegram_id = int(order_id)  # мы передаём telegram_id как order_id
+    if data.get("status") == "success":
+        custom = data.get("custom_fields", {})
+        user_id = int(custom.get("telegram_id", 0))
+        product = custom.get("product", "")
 
-        # В зависимости от товара открываем доступ
-        product = data.get("product", "").lower()
-        if "vip" in product:
-            VIP_USERS.add(telegram_id)
-        else:
-            COURSE_USERS.add(telegram_id)
+        if user_id:
+            if user_id not in user_access:
+                user_access[user_id] = {}
+            if "vip" in product.lower():
+                user_access[user_id]["vip"] = True
+            else:
+                user_access[user_id]["course"] = True
 
-        print(f"Доступ открыт пользователю {telegram_id} для: {product}")
-    return "", 200
+            asyncio.run(send_telegram_message(user_id, "Спасибо за оплату! Доступ открыт."))
+    return "ok", 200
 
-# ==== ЗАПУСК ====
+# Отправка сообщений пользователям
+async def send_telegram_message(user_id, text):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    requests.post(url, data={"chat_id": user_id, "text": text})
+
+# Запуск бота и Flask одновременно
+def run_bot():
+    app_bot = ApplicationBuilder().token(BOT_TOKEN).build()
+    app_bot.add_handler(CommandHandler("start", start))
+    app_bot.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app_bot.run_polling()
 
 if __name__ == "__main__":
     import threading
-
-    async def telegram_bot():
-        tg_app = ApplicationBuilder().token(BOT_TOKEN).build()
-        tg_app.add_handler(CommandHandler("start", start))
-        tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
-        await tg_app.run_polling()
-
-    threading.Thread(target=lambda: app.run(port=5000)).start()
-
-    import asyncio
-    asyncio.run(telegram_bot())
+    threading.Thread(target=run_bot).start()
+    app.run(host="0.0.0.0", port=10000)
